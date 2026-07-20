@@ -4,6 +4,10 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  define: {
+    // ビルド日時(⚙設定に表示。更新が反映されたかの確認用)
+    __BUILD_TIME__: JSON.stringify(new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC'),
+  },
   server: {
     // dev時は /api を中継サーバー(server.js)へ転送
     proxy: {

@@ -18,7 +18,7 @@ const READY_TEXT = 'タップして話しかけてください'
 // 開いたときの時間帯挨拶(音声はまだ再生できないのでテキストのみ)
 function greetingText(): string {
   const h = new Date().getHours()
-  if (h >= 5 && h < 11) return 'おはよう、のってぃ☀ 今日もよろしくね'
+  if (h >= 5 && h < 11) return 'おはよう☀ 今日もよろしくね'
   if (h >= 11 && h < 17) return 'こんにちは!なにか話す?'
   if (h >= 17 && h < 23) return 'こんばんは。今日はどんな一日だった?'
   return 'こんな時間まで起きてるの?夜更かしさんだね🌙'
@@ -26,6 +26,8 @@ function greetingText(): string {
 
 // これを言ったら連続会話を終了する
 const GOODBYE_WORDS = ['じゃあね', 'またね', 'バイバイ', 'ばいばい', 'おしまい', '終了', 'おやすみ']
+// 連続会話で自動的にマイクを再開したあと、無音のまま聞き直しを続ける最大時間(ms)
+const CONTINUOUS_LISTEN_MS = 30000
 const GOODBYE_WORDS_EN = ['bye', 'goodbye', 'see you', 'good night']
 
 // 英会話モード: off=日本語 / correct=添削あり / only=英語のみ
@@ -53,17 +55,6 @@ function detectEmotion(text: string): EmotionName | null {
   if (max === angry) return 'angry'
   return 'surprised'
 }
-
-// 相づち: 認識直後に即発話して、返答を考えている間の沈黙を埋める
-const AIZUCHI = [
-  'うん、うん。',
-  'ふむふむ。',
-  'えっとね…',
-  'なるほど。',
-  'ちょっと待ってね。',
-  'んー、そうだね…',
-]
-const AIZUCHI_EN = ['Uh-huh.', 'I see.', 'Okay.', 'Right.', 'Let me think...', 'Hmm.']
 
 // タップ反応の音声(待機中のみ再生。パターンごとに複数からランダム)
 const POKE_LINES: Record<PokePattern, string[]> = {
@@ -132,6 +123,10 @@ export default function App() {
   // 連続会話: 返答の再生が終わったら自動でマイクを再開するか
   const autoListenRef = useRef(false)
   const startRecRef = useRef<() => void>(() => {})
+  // 連続会話での聞き直し猶予: ブラウザは無音が続くと数秒で認識を打ち切るため、
+  // 猶予内なら黙って認識を再起動して聞き続ける(終了ボタンを押すまで最大30秒待つ)
+  const continuousActiveRef = useRef(false)
+  const continuousDeadlineRef = useRef(0)
   const { messages, addMessage } = useChatHistory()
   const sessionId = useMemo(() => getSessionId(), [])
 
@@ -152,6 +147,8 @@ export default function App() {
       // 連続会話: 音声で話しかけた会話なら、返答後に自動でマイクを再開する
       if (autoListenRef.current) {
         autoListenRef.current = false
+        continuousActiveRef.current = true
+        continuousDeadlineRef.current = Date.now() + CONTINUOUS_LISTEN_MS
         startRecRef.current()
         setState('listening')
         setStatusText('聞いています...')
@@ -177,18 +174,22 @@ export default function App() {
         (english && GOODBYE_WORDS_EN.some((w) => text.toLowerCase().includes(w)))
       autoListenRef.current = viaVoice && !saidGoodbye
 
-      // 相づちを即発話(TTSキューの先頭に入れるので、本返答と途切れなく繋がる)
-      const aizuchiList = english ? AIZUCHI_EN : AIZUCHI
+      // 返答を待つ間は 'processing' のまま(アバターが考える仕草をする)。
+      // 音声で埋めるのではなく、最初の一文が届いた時点で 'speaking' に切り替えて喋り始める。
       beginStream()
-      pushSentence(aizuchiList[Math.floor(Math.random() * aizuchiList.length)])
-      setState('speaking')
 
       // ストリーミング: 文が完成するたびにTTSへ流し、全文を待たずに喋り始める
       try {
         let acc = ''
         let buffer = ''
+        let spoke = false
         const flush = (sentence: string) => {
-          if (sentence.trim()) pushSentence(sentence)
+          if (!sentence.trim()) return
+          if (!spoke) {
+            spoke = true
+            setState('speaking')
+          }
+          pushSentence(sentence)
         }
         const full = await sendChatStream(text, sessionId, (delta) => {
           acc += delta
@@ -215,14 +216,17 @@ export default function App() {
         const reply = response || '返答が空でした。設定を確認してください。'
         addMessage('assistant', reply)
         setStatusText(reply)
-        // 相づちの続きとしてキューで再生
+        // 文単位でキュー再生
         const { sentences, rest } = splitSentences(reply)
-        ;[...sentences, rest].forEach((s) => { if (s.trim()) pushSentence(s) })
+        const toSpeak = [...sentences, rest].filter((s) => s.trim())
+        if (toSpeak.length) setState('speaking')
+        toSpeak.forEach((s) => pushSentence(s))
         finishStream()
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error)
         autoListenRef.current = false // エラー時はマイク自動再開しない
-        stopTTS() // 相づちが鳴っていれば止める(state/文言はonEndでリセットされる)
+        continuousActiveRef.current = false
+        stopTTS() // 再生中なら止める(state/文言はonEndでリセットされる)
         setErrorText(message)
         addMessage('assistant', `エラー: ${message}`)
       }
@@ -234,6 +238,7 @@ export default function App() {
   const handleResult = useCallback(
     (text: string) => {
       setErrorText('')
+      continuousActiveRef.current = false // 発話を受け取れたので聞き直しループは終了
       const trimmed = text.trim()
       if (!trimmed) {
         setState('idle')
@@ -245,8 +250,15 @@ export default function App() {
     [submitText],
   )
 
-  // 無音等で認識が終了した(結果なし): 会話を自然に終える
+  // 無音等で認識が終了した(結果なし)。
+  // 連続会話の聞き直し猶予(30秒)内なら、黙って認識を再起動して聞き続ける。
+  // 猶予を過ぎたら会話を自然に終える。
   const handleRecIdle = useCallback(() => {
+    if (continuousActiveRef.current && Date.now() < continuousDeadlineRef.current) {
+      startRecRef.current()
+      return
+    }
+    continuousActiveRef.current = false
     autoListenRef.current = false
     if (stateNowRef.current === 'listening') {
       setState('idle')
@@ -265,17 +277,22 @@ export default function App() {
     setErrorText('')
     if (state === 'speaking') {
       autoListenRef.current = false // 手動停止時はマイク自動再開しない
+      continuousActiveRef.current = false
       stopTTS()
       return
     }
 
     if (isListening) {
+      // 終了ボタン: 連続会話の聞き直しループもここで止める
+      continuousActiveRef.current = false
       stop()
       setState('idle')
       setStatusText(READY_TEXT)
       return
     }
 
+    // 新規に会話を始めるタップ。前の連続会話の聞き直し猶予が残っていれば破棄する
+    continuousActiveRef.current = false
     // iOSの音声再生ブロック対策: ユーザー操作中に事前解放
     unlockTTS()
     start()
@@ -319,7 +336,7 @@ export default function App() {
 
   return (
     <div
-      className="min-h-dvh flex flex-col items-center justify-between pb-6 px-4"
+      className="app-root min-h-dvh flex flex-col items-center justify-between pb-6 px-4"
       style={{ background: 'var(--bg-primary)' }}
     >
       <div className="flex flex-col items-center gap-1 w-full">
@@ -396,27 +413,32 @@ export default function App() {
           </form>
         )}
         {state === 'idle' && showSettings && (
-          <div className="flex items-center gap-3 w-full max-w-sm px-4 text-sm text-[var(--text-secondary)]">
-            <span className="shrink-0">話速 {voiceSpeed.toFixed(1)}</span>
-            <input
-              type="range"
-              min={0.8}
-              max={1.6}
-              step={0.1}
-              value={voiceSpeed}
-              onChange={(e) => {
-                const v = Number(e.target.value)
-                setVoiceSpeed(v)
-                localStorage.setItem('voice-speed', String(v))
-              }}
-              className="flex-1 accent-[var(--accent)]"
-            />
-            <button
-              onClick={() => setShowSettings(false)}
-              className="rounded-full w-9 h-9 shrink-0 bg-white/10 hover:bg-white/20 text-sm"
-            >
-              ✕
-            </button>
+          <div className="flex flex-col items-center gap-1 w-full max-w-sm px-4">
+            <div className="flex items-center gap-3 w-full text-sm text-[var(--text-secondary)]">
+              <span className="shrink-0">話速 {voiceSpeed.toFixed(1)}</span>
+              <input
+                type="range"
+                min={0.8}
+                max={1.6}
+                step={0.1}
+                value={voiceSpeed}
+                onChange={(e) => {
+                  const v = Number(e.target.value)
+                  setVoiceSpeed(v)
+                  localStorage.setItem('voice-speed', String(v))
+                }}
+                className="flex-1 accent-[var(--accent)]"
+              />
+              <button
+                onClick={() => setShowSettings(false)}
+                className="rounded-full w-9 h-9 shrink-0 bg-white/10 hover:bg-white/20 text-sm"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="text-[10px] text-[var(--text-secondary)] opacity-50">
+              ビルド: {__BUILD_TIME__}
+            </p>
           </div>
         )}
         {state === 'idle' && showEngMenu && (

@@ -20,6 +20,13 @@ body {
   -webkit-user-select: none;
 }
 
+/* WebXR ARのDOM Overlayはbody全体を上に重ねるため、AR中は不透明な背景を消して
+   カメラ映像が透けるようにする(UI部品自体は個別にbg-*を持つのでそのまま見える) */
+body.ar-active,
+body.ar-active .app-root {
+  background: transparent !important;
+}
+
 @keyframes pulse-ring {
   0% { transform: scale(1); opacity: 0.6; }
   100% { transform: scale(1.5); opacity: 0; }

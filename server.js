@@ -76,7 +76,38 @@ const voicevoxSpeed = Number(process.env.VOICEVOX_SPEED || 1.1)
 
 app.use(express.json({ limit: '1mb' }))
 
-// VOICEVOXでテキストをwav化して返す(audio_query → synthesis)
+// 合成結果のキャッシュ(LRU)。相づち・つなぎ等の定型文は2回目以降0msで返る
+const ttsCache = new Map()
+const TTS_CACHE_MAX = 100
+
+// VOICEVOXでテキストをwav化(audio_query → synthesis)。失敗時はthrow
+async function synthesize(text, speaker, speed) {
+  const key = `${speaker}|${speed}|${text}`
+  const hit = ttsCache.get(key)
+  if (hit) {
+    ttsCache.delete(key)
+    ttsCache.set(key, hit) // 使ったものを末尾へ(LRU)
+    return hit
+  }
+  const qRes = await fetch(
+    `${voicevoxUrl}/audio_query?text=${encodeURIComponent(text)}&speaker=${speaker}`,
+    { method: 'POST' },
+  )
+  if (!qRes.ok) throw new Error(`VOICEVOX audio_query failed: ${await qRes.text()}`)
+  const query = await qRes.json()
+  query.speedScale = speed
+  const sRes = await fetch(`${voicevoxUrl}/synthesis?speaker=${speaker}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(query),
+  })
+  if (!sRes.ok) throw new Error(`VOICEVOX synthesis failed: ${await sRes.text()}`)
+  const wav = Buffer.from(await sRes.arrayBuffer())
+  ttsCache.set(key, wav)
+  if (ttsCache.size > TTS_CACHE_MAX) ttsCache.delete(ttsCache.keys().next().value)
+  return wav
+}
+
 app.post('/api/tts', async (req, res) => {
   try {
     const text = String(req.body?.text || '').trim()
@@ -86,25 +117,7 @@ app.post('/api/tts', async (req, res) => {
     // アプリからの話速指定(0.5〜2.0)。無ければ.envのデフォルト
     const reqSpeed = Number(req.body?.speed)
     const speed = reqSpeed >= 0.5 && reqSpeed <= 2 ? reqSpeed : voicevoxSpeed
-    const qRes = await fetch(
-      `${voicevoxUrl}/audio_query?text=${encodeURIComponent(text)}&speaker=${speaker}`,
-      { method: 'POST' },
-    )
-    if (!qRes.ok) {
-      return res.status(502).json({ error: 'VOICEVOX audio_query failed', detail: await qRes.text() })
-    }
-    const query = await qRes.json()
-    query.speedScale = speed
-
-    const sRes = await fetch(`${voicevoxUrl}/synthesis?speaker=${speaker}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(query),
-    })
-    if (!sRes.ok) {
-      return res.status(502).json({ error: 'VOICEVOX synthesis failed', detail: await sRes.text() })
-    }
-    const wav = Buffer.from(await sRes.arrayBuffer())
+    const wav = await synthesize(text, speaker, speed)
     res.set('Content-Type', 'audio/wav').send(wav)
   } catch (error) {
     // VOICEVOX未起動など。フロントはOS標準TTSにフォールバックする
@@ -214,9 +227,36 @@ app.post('/api/chat-stream', async (req, res) => {
 app.use(express.static(staticDir))
 app.get('*', (_req, res) => res.sendFile(path.join(staticDir, 'index.html')))
 
+// 起動時ウォームアップ:
+//  1. 話者モデルを事前初期化(エンジン起動後の初回合成が数秒かかるのを防ぐ)
+//  2. よく使う定型文(タップ反応のセリフ)を事前合成してキャッシュ
+//  ※フレーズはフロント(src/App.tsx の POKE_LINES)と同期しておくこと
+const PREWARM_TEXTS = [
+  'えへへ、なでなで?', 'ちょっと照れるなあ',
+  'んー、きもちいい', 'えへへ、ありがと',
+  'わっ、びっくりした!', 'きゃっ!?なになに?',
+  'くすぐったいよー', 'あはは、やめてよー',
+  'もう、いたずらしないの', 'ぷんぷん',
+]
+async function warmupVoicevox() {
+  try {
+    const t0 = Date.now()
+    await fetch(`${voicevoxUrl}/initialize_speaker?speaker=${voicevoxSpeaker}&skip_reinit=true`, {
+      method: 'POST',
+    })
+    for (const text of PREWARM_TEXTS) {
+      await synthesize(text, voicevoxSpeaker, voicevoxSpeed)
+    }
+    console.log(`VOICEVOX warmup done: speaker ${voicevoxSpeaker} + ${PREWARM_TEXTS.length} phrases cached (${Date.now() - t0}ms)`)
+  } catch (error) {
+    console.warn(`VOICEVOX warmup skipped: ${String(error?.message || error)}`)
+  }
+}
+
 app.listen(port, '0.0.0.0', () => {
   console.log(`voice-assistant LAN server listening on http://0.0.0.0:${port}`)
   console.log(`agent: ${gatewayKind} at ${gatewayUrl} (model: ${gatewayModel}, session: ${sessionKey})`)
   console.log(`VOICEVOX at ${voicevoxUrl} (speaker: ${voicevoxSpeaker}, speed: ${voicevoxSpeed})`)
   if (!gatewayToken) console.warn('⚠ GATEWAY_TOKEN 未設定 — .env を用意してください')
+  void warmupVoicevox()
 })
