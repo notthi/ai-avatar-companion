@@ -131,17 +131,21 @@ export function VrmAvatar({ state, getLevel, getSpeaking, emotion, spinSignal, d
       .then((ok) => { if (!disposed) setArSupported(ok) })
       .catch(() => { /* 非対応扱い */ })
 
-    // springBoneのコライダー半径はモデルのスケールに追従しない(three-vrmはスケール1前提)。
-    // 縮小時に実物大の当たり判定球が残ると髪・スカートが外へ押し出されて固まるため、
-    // 読み込み時に元半径を控えておき、表示スケールに合わせて同期させる(animate内)
+    // three-vrmには「ワールド単位で定義され、モデルのスケールに追従しない」値がある
+    // (スケール1前提の設計)。縮小時にそのままだと、
+    //  - springBoneのコライダー半径 → 実物大の当たり判定球が髪・スカートを外へ押し出す
+    //  - MToonの輪郭線幅(worldCoordinatesモード) → 線が相対的に極太になる
+    // ため、読み込み時に元値を控えておき、表示スケールに合わせて同期させる(animate内)
     const springColliderRadii: { shape: { radius: number }; base: number }[] = []
     const springJointRadii: { settings: { hitRadius: number }; base: number }[] = []
+    const outlineWidths: { mat: { outlineWidthFactor: number }; base: number }[] = []
     let appliedSpringScale = 1
     const syncSpringScale = (s: number) => {
       if (s === appliedSpringScale) return
       appliedSpringScale = s
       for (const c of springColliderRadii) c.shape.radius = c.base * s
       for (const j of springJointRadii) j.settings.hitRadius = j.base * s
+      for (const o of outlineWidths) o.mat.outlineWidthFactor = o.base * s
     }
 
     // 直前フレームの目標スケール。変化した瞬間だけspringBoneをリセットする(下のanimate内で使用)
@@ -242,6 +246,18 @@ export function VrmAvatar({ state, getLevel, getSpeaking, emotion, spinSignal, d
         })
         loaded.springBoneManager?.joints.forEach((j) => {
           springJointRadii.push({ settings: j.settings, base: j.settings.hitRadius })
+        })
+        // MToonの輪郭線幅(ワールド単位モードのみ)もスケール同期の対象に控える
+        loaded.scene.traverse((o) => {
+          const mesh = o as THREE.Mesh
+          if (!mesh.isMesh) return
+          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+          mats.forEach((m) => {
+            const mt = m as unknown as { outlineWidthMode?: string; outlineWidthFactor?: number }
+            if (mt.outlineWidthMode === 'worldCoordinates' && typeof mt.outlineWidthFactor === 'number' && mt.outlineWidthFactor > 0) {
+              outlineWidths.push({ mat: mt as { outlineWidthFactor: number }, base: mt.outlineWidthFactor })
+            }
+          })
         })
         vrm = loaded
       },
