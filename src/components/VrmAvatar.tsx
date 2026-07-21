@@ -274,6 +274,11 @@ export function VrmAvatar({ state, getLevel, getSpeaking, emotion, spinSignal, d
       const delta = clock.getDelta()
       const t = clock.elapsedTime
       const presenting = renderer.xr.isPresenting
+      // 保険: ARを抜けているのに透明化クラスが残っていたら毎フレーム強制的に外す
+      // (セッション終了イベントを取りこぼした場合、白画面のまま固まるのを防ぐ)
+      if (!presenting && document.body.classList.contains('ar-active')) {
+        document.body.classList.remove('ar-active')
+      }
 
       if (!presenting) {
         // 傾きパララックス: カメラが回り込み、視線追従で常にこちらを見ている感じになる
